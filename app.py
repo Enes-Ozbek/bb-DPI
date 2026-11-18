@@ -3,27 +3,31 @@ bb-DPI — A Cloudflare WARP–inspired toggle for GoodbyeDPI.
 PyQt6 · System-tray · Borderless · Fluent Dark Mode
 """
 
-import sys, os, subprocess, time, logging, configparser
+import sys, os, re, subprocess, time, logging, configparser, threading, shlex, tempfile, ctypes
+from collections import deque
 from PyQt6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QLabel,
     QSystemTrayIcon, QMenu, QGraphicsDropShadowEffect,
-    QHBoxLayout, QFrame,
+    QHBoxLayout, QFrame, QMessageBox,
 )
 from PyQt6.QtCore import (
     Qt, QTimer, QThread, pyqtSignal, QPoint, QSize, QRectF,
-    QPropertyAnimation, pyqtProperty, QEasingCurve,
+    QPropertyAnimation, pyqtProperty, QEasingCurve, QLockFile, QUrl,
 )
 from PyQt6.QtGui import (
     QIcon, QPainter, QColor, QFont, QFontDatabase,
     QPen, QBrush, QRadialGradient, QLinearGradient,
-    QAction, QPixmap, QPainterPath, QCursor,
+    QAction, QPixmap, QPainterPath, QCursor, QDesktopServices,
 )
 
+IS_WINDOWS = os.name == "nt"
+
 # ── Logging ──────────────────────────────────────────────────────────────────
-LOG_DIR = os.path.join(os.environ.get("APPDATA", ""), "bb-DPI")
+LOG_DIR = os.path.join(os.environ.get("APPDATA") or os.path.expanduser("~"), "bb-DPI")
 os.makedirs(LOG_DIR, exist_ok=True)
+LOG_PATH = os.path.join(LOG_DIR, "app.log")
 logging.basicConfig(
-    filename=os.path.join(LOG_DIR, "app.log"),
+    filename=LOG_PATH,
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S"
@@ -46,12 +50,16 @@ def get_resource_path(relative_path):
 
 # ── Config ───────────────────────────────────────────────────────────────────
 CONFIG_PATH = os.path.join(get_base_dir(), "config.ini")
-config = configparser.ConfigParser()
+DEFAULT_ARGS = "-5"
+DEFAULT_MODE_TEXT = "Mode 5  ·  Alternative 2"
+
+# interpolation=None so a literal "%" in the arguments can't break parsing.
+config = configparser.ConfigParser(interpolation=None)
 
 if not os.path.exists(CONFIG_PATH):
     config["Settings"] = {
-        "Arguments": "-5",
-        "ModeText": "Mode 5  ·  Alternative 2"
+        "Arguments": DEFAULT_ARGS,
+        "ModeText": DEFAULT_MODE_TEXT,
     }
     try:
         with open(CONFIG_PATH, "w", encoding="utf-8") as f:
@@ -60,14 +68,15 @@ if not os.path.exists(CONFIG_PATH):
     except Exception as e:
         logging.error(f"Could not create config.ini: {e}")
 
-config.read(CONFIG_PATH, encoding="utf-8")
 try:
-    GDPI_ARGS = config.get("Settings", "Arguments").split()
-    MODE_TEXT = config.get("Settings", "ModeText")
+    config.read(CONFIG_PATH, encoding="utf-8")
 except Exception as e:
     logging.error(f"Error reading config: {e}")
-    GDPI_ARGS = ["-5"]
-    MODE_TEXT = "Mode 5  ·  Alternative 2"
+
+# Arguments are kept as one string and handed to goodbyedpi as-is (like a .cmd
+# file would), so quoted paths such as --blacklist "C:\My Lists\x.txt" work.
+GDPI_ARGS = config.get("Settings", "Arguments", fallback=DEFAULT_ARGS).strip()
+MODE_TEXT = config.get("Settings", "ModeText", fallback=DEFAULT_MODE_TEXT)
 
 # Auto-detect: looks next to this script, in ./x86_64, ./goodbyedpi, etc.
 def find_gdpi():
@@ -83,14 +92,12 @@ def find_gdpi():
         if os.path.isdir(d):
             candidates.append(d)
             candidates.append(os.path.join(d, "x86_64"))
-            
+
     for d in candidates:
         p = os.path.join(d, GOODBYEDPI_EXE)
         if os.path.isfile(p):
             return d, p
     return base, os.path.join(base, GOODBYEDPI_EXE)
-
-GDPI_DIR, GDPI_PATH = find_gdpi()
 
 # ── Palette ──────────────────────────────────────────────────────────────────
 C = dict(
@@ -102,65 +109,262 @@ C = dict(
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-#  Worker thread – runs goodbyedpi.exe
+#  Windows helpers – admin rights, pre-flight checks, kill-on-exit job
 # ═══════════════════════════════════════════════════════════════════════════════
-class DPIWorker(QThread):
-    started  = pyqtSignal()
-    failed   = pyqtSignal(str)
-    finished_signal = pyqtSignal()
+def is_admin():
+    if not IS_WINDOWS:
+        return True
+    try:
+        return bool(ctypes.windll.shell32.IsUserAnAdmin())
+    except Exception:
+        return False
+
+
+def relaunch_as_admin():
+    """Ask UAC to start an elevated copy of bb-DPI. True if it was launched."""
+    if getattr(sys, "frozen", False):
+        params = sys.argv[1:]
+    else:
+        params = [os.path.abspath(sys.argv[0])] + sys.argv[1:]
+    params = subprocess.list2cmdline(params + ["--elevated"])
+    try:
+        rc = ctypes.windll.shell32.ShellExecuteW(
+            None, "runas", sys.executable, params, get_base_dir(), 1)
+    except Exception as e:
+        logging.error(f"Could not relaunch as Administrator: {e}")
+        return False
+    return rc > 32
+
+
+def preflight(gdpi_dir, gdpi_path):
+    """Catch the usual reasons goodbyedpi fails, before starting it.
+
+    This matters because when goodbyedpi can't load its WinDivert driver it
+    prints an error and then sleeps 20 s before exiting, so these failures
+    would otherwise look like a working connection for a while.
+    Returns an error message, or None if everything looks fine.
+    """
+    if not os.path.isfile(gdpi_path):
+        return (f"goodbyedpi.exe not found. Put the GoodbyeDPI files next to "
+                f"bb-DPI in: {get_base_dir()}")
+    if IS_WINDOWS:
+        if not os.path.isfile(os.path.join(gdpi_dir, "WinDivert.dll")):
+            return f"WinDivert.dll is missing next to goodbyedpi.exe in: {gdpi_dir}"
+        if not any(os.path.isfile(os.path.join(gdpi_dir, n))
+                   for n in ("WinDivert64.sys", "WinDivert32.sys")):
+            return f"WinDivert64.sys is missing next to goodbyedpi.exe in: {gdpi_dir}"
+        if not is_admin():
+            return "Administrator rights needed. Restart bb-DPI as Administrator."
+    return None
+
+
+class KillOnCloseJob:
+    """Windows job object that takes goodbyedpi down together with bb-DPI.
+
+    If bb-DPI crashes or is ended from Task Manager, Windows closes our handle
+    to the job and terminates everything in it, so goodbyedpi can't be left
+    running with no button to switch it off.
+    """
 
     def __init__(self):
-        super().__init__()
-        self.proc = None
+        self._handle = None
+        if not IS_WINDOWS:
+            return
+        try:
+            from ctypes import wintypes
+
+            class IO_COUNTERS(ctypes.Structure):
+                _fields_ = [(name, ctypes.c_ulonglong) for name in (
+                    "ReadOperationCount", "WriteOperationCount", "OtherOperationCount",
+                    "ReadTransferCount", "WriteTransferCount", "OtherTransferCount")]
+
+            class BASIC_LIMIT_INFORMATION(ctypes.Structure):
+                _fields_ = [
+                    ("PerProcessUserTimeLimit", ctypes.c_int64),
+                    ("PerJobUserTimeLimit", ctypes.c_int64),
+                    ("LimitFlags", wintypes.DWORD),
+                    ("MinimumWorkingSetSize", ctypes.c_size_t),
+                    ("MaximumWorkingSetSize", ctypes.c_size_t),
+                    ("ActiveProcessLimit", wintypes.DWORD),
+                    ("Affinity", ctypes.c_size_t),
+                    ("PriorityClass", wintypes.DWORD),
+                    ("SchedulingClass", wintypes.DWORD),
+                ]
+
+            class EXTENDED_LIMIT_INFORMATION(ctypes.Structure):
+                _fields_ = [
+                    ("BasicLimitInformation", BASIC_LIMIT_INFORMATION),
+                    ("IoInfo", IO_COUNTERS),
+                    ("ProcessMemoryLimit", ctypes.c_size_t),
+                    ("JobMemoryLimit", ctypes.c_size_t),
+                    ("PeakProcessMemoryUsed", ctypes.c_size_t),
+                    ("PeakJobMemoryUsed", ctypes.c_size_t),
+                ]
+
+            k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            k32.CreateJobObjectW.argtypes = [ctypes.c_void_p, wintypes.LPCWSTR]
+            k32.CreateJobObjectW.restype = wintypes.HANDLE
+            k32.SetInformationJobObject.argtypes = [
+                wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD]
+            k32.SetInformationJobObject.restype = wintypes.BOOL
+            k32.AssignProcessToJobObject.argtypes = [wintypes.HANDLE, wintypes.HANDLE]
+            k32.AssignProcessToJobObject.restype = wintypes.BOOL
+
+            job = k32.CreateJobObjectW(None, None)
+            if not job:
+                raise ctypes.WinError(ctypes.get_last_error())
+            info = EXTENDED_LIMIT_INFORMATION()
+            info.BasicLimitInformation.LimitFlags = 0x2000  # JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+            JobObjectExtendedLimitInformation = 9
+            if not k32.SetInformationJobObject(job, JobObjectExtendedLimitInformation,
+                                               ctypes.byref(info), ctypes.sizeof(info)):
+                raise ctypes.WinError(ctypes.get_last_error())
+            self._k32, self._handle = k32, job
+        except Exception as e:
+            logging.warning(f"Kill-on-exit job unavailable: {e}")
+
+    def assign(self, proc):
+        if not self._handle:
+            return
+        try:
+            if not self._k32.AssignProcessToJobObject(self._handle, int(proc._handle)):
+                raise ctypes.WinError(ctypes.get_last_error())
+        except Exception as e:
+            logging.warning(f"Could not attach goodbyedpi to kill-on-exit job: {e}")
+
+
+def _hidden_window_kwargs():
+    if not IS_WINDOWS:
+        return {}
+    si = subprocess.STARTUPINFO()
+    si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+    si.wShowWindow = subprocess.SW_HIDE
+    return {"startupinfo": si, "creationflags": subprocess.CREATE_NO_WINDOW}
+
+
+_ERROR_HINT = re.compile(r"error|can't|cannot|could not|should be used|not found|denied", re.I)
+
+def summarize_output(lines, code):
+    """Pick the most useful line out of goodbyedpi's console output."""
+    if any(line.startswith("Usage:") for line in lines):
+        return "goodbyedpi didn't accept the Arguments in config.ini"
+    for i, line in enumerate(lines):
+        if _ERROR_HINT.search(line):
+            # e.g. "Error opening filter: 2 ..." + "The driver files ... were not found."
+            if line.startswith("Error opening filter") and i + 1 < len(lines):
+                return f"{line} {lines[i + 1]}"
+            return line
+    if lines:
+        return lines[-1]
+    return f"goodbyedpi.exe exited with code {code}"
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+#  Worker thread – runs goodbyedpi.exe
+# ═══════════════════════════════════════════════════════════════════════════════
+STARTUP_GRACE = 1.5    # seconds goodbyedpi has to stay alive to count as connected
+FAILURE_WINDOW = 30.0  # an exit within this many seconds means it never really worked
+
+
+class DPIWorker(QThread):
+    connected = pyqtSignal()
+    failed    = pyqtSignal(str, str)   # (title, detail)
+
+    def __init__(self, gdpi_dir, gdpi_path, args, job=None, parent=None):
+        super().__init__(parent)
+        self._dir, self._path, self._args, self._job = gdpi_dir, gdpi_path, args, job
+        self._proc = None
+        self._lock = threading.Lock()
+        self._stopping = False
+        self._output = deque(maxlen=60)
+
+    def _command(self):
+        if IS_WINDOWS:
+            return f"{subprocess.list2cmdline([self._path])} {self._args}".strip()
+        return [self._path] + shlex.split(self._args)
 
     def run(self):
         try:
-            si = subprocess.STARTUPINFO()
-            si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-            si.wShowWindow = subprocess.SW_HIDE
-            self.proc = subprocess.Popen(
-                [GDPI_PATH] + GDPI_ARGS,
-                cwd=GDPI_DIR,
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                startupinfo=si,
-                creationflags=subprocess.CREATE_NO_WINDOW,
-            )
-            time.sleep(1.2)
-            if self.proc.poll() is not None:
-                err = self.proc.stderr.read().decode(errors="ignore")
-                self.failed.emit(err or "Process exited immediately.")
-                return
-            self.started.emit()
-            self.proc.wait()
-        except FileNotFoundError:
-            self.failed.emit(f"goodbyedpi.exe not found in:\n{GDPI_DIR}")
-        except PermissionError:
-            self.failed.emit("Permission denied – run as Administrator.")
-        except Exception as e:
-            self.failed.emit(str(e))
-        finally:
-            self.finished_signal.emit()
+            with self._lock:
+                if self._stopping:
+                    return
+                self._proc = subprocess.Popen(
+                    self._command(),
+                    cwd=self._dir,
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    **_hidden_window_kwargs(),
+                )
+                proc = self._proc
+        except OSError as e:
+            if getattr(e, "winerror", None) == 740:  # ERROR_ELEVATION_REQUIRED
+                detail = "Administrator rights needed. Restart bb-DPI as Administrator."
+            else:
+                detail = f"Could not start goodbyedpi.exe: {e.strerror or e}"
+            logging.error(detail)
+            self.failed.emit("Failed", detail)
+            return
 
-    def kill(self):
-        if self.proc:
-            pid = self.proc.pid
-            logging.info(f"Terminating goodbyedpi.exe (PID {pid})...")
+        logging.info(f"Started goodbyedpi.exe (PID {proc.pid}) with: {self._args}")
+        if self._job:
+            self._job.assign(proc)
+        # Drain its output continuously so a full pipe can never block it.
+        reader = threading.Thread(target=self._pump, args=(proc.stdout,), daemon=True)
+        reader.start()
+        started_at = time.monotonic()
+
+        try:
+            code = proc.wait(timeout=STARTUP_GRACE)
+        except subprocess.TimeoutExpired:
+            if not self._stopping:
+                self.connected.emit()
+            code = proc.wait()
+        reader.join(timeout=2)
+
+        if self._stopping:
+            return
+        lived = time.monotonic() - started_at
+        lines = list(self._output)
+        logging.error(f"goodbyedpi.exe exited by itself (code {code}) after {lived:.1f}s")
+        title = "Failed" if lived < FAILURE_WINDOW else "Stopped"
+        self.failed.emit(title, summarize_output(lines, code))
+
+    def _pump(self, stream):
+        encoding = "mbcs" if IS_WINDOWS else "utf-8"
+        try:
+            for raw in iter(stream.readline, b""):
+                line = raw.decode(encoding, errors="replace").strip()
+                if line:
+                    self._output.append(line)
+                    logging.info(f"[goodbyedpi] {line}")
+        except (OSError, ValueError):
+            pass
+        finally:
             try:
-                subprocess.run(["taskkill", "/pid", str(pid), "/t", "/f"],
-                               capture_output=True,
-                               creationflags=subprocess.CREATE_NO_WINDOW)
-                logging.info(f"Successfully killed PID {pid}.")
-            except Exception as e:
-                logging.error(f"Error terminating PID {pid}: {e}")
-            try: self.proc.terminate()
-            except: pass
-            try: self.proc.kill()
-            except: pass
-            self.proc = None
-        else:
-            logging.info("No active process to terminate.")
+                stream.close()
+            except OSError:
+                pass
+
+    def stop(self, timeout=5.0):
+        """Kill goodbyedpi. Returns False only if it is somehow still running."""
+        with self._lock:
+            self._stopping = True
+            proc = self._proc
+        if proc is None or proc.poll() is not None:
+            return True
+        logging.info(f"Stopping goodbyedpi.exe (PID {proc.pid})...")
+        try:
+            proc.kill()
+        except OSError as e:
+            logging.error(f"Error terminating PID {proc.pid}: {e}")
+        try:
+            proc.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            logging.error(f"goodbyedpi.exe (PID {proc.pid}) did not exit.")
+            return False
+        logging.info(f"Stopped PID {proc.pid}.")
+        return True
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -257,7 +461,9 @@ class ToggleSwitch(QWidget):
         if self._on or self._connecting:
             pulse_s = 1.0 + 0.05 * math.sin(self._pulse) if self._on else 1.0
             for i in range(6):
-                r = 84 + i * 6
+                # Largest ring × pulse must stay inside the 200px widget,
+                # otherwise the glow gets clipped into a square.
+                r = 80 + i * 3
                 gc = QColor(accent)
                 gc.setAlpha(max(0, 45 - i * 8))
                 p.setPen(Qt.PenStyle.NoPen)
@@ -349,7 +555,7 @@ class MainWindow(QWidget):
         super().__init__()
         self.setWindowTitle("bb-DPI")
         self.setWindowIcon(QIcon(get_resource_path("icon.ico")))
-        self.setFixedSize(276, 396)
+        self.setFixedSize(276, 416)
         self.setWindowFlags(
             Qt.WindowType.FramelessWindowHint
             | Qt.WindowType.WindowStaysOnTopHint
@@ -360,7 +566,6 @@ class MainWindow(QWidget):
 
         # Remove Windows 11 1px border
         try:
-            import ctypes
             hwnd = int(self.winId())
             DWMWA_BORDER_COLOR = 34
             value = ctypes.c_int(0xFFFFFFFE) # DWMWA_COLOR_NONE
@@ -370,9 +575,11 @@ class MainWindow(QWidget):
         except Exception:
             pass
 
-        self._is_running = False
+        # "off" | "connecting" | "on" | "error"   ("error" behaves like "off")
+        self._state = "off"
         self._worker = None
         self._uptime_start = 0
+        self._job = KillOnCloseJob()
 
         self._build_ui()
         self._build_tray()
@@ -384,15 +591,14 @@ class MainWindow(QWidget):
         # For window dragging
         self._drag_pos = QPoint()
 
-        # Startup Validation
-        gdpi_d, gdpi_p = find_gdpi()
-        if not os.path.isfile(gdpi_p):
-            msg = f"goodbyedpi.exe not found!\nPlease place it in:\n{get_base_dir()}"
-            logging.error(msg.replace("\n", " "))
-            self.status_lbl.setText("Error")
-            self.status_lbl.setStyleSheet(f"color: {{C['red']}}; background: transparent;")
-            self.sub_lbl.setText("goodbyedpi.exe missing")
-            self.toggle.setEnabled(False)
+        self._set_state("off")
+
+        # Startup validation (re-checked on every click, so dropping the
+        # files in later works without restarting bb-DPI)
+        problem = preflight(*find_gdpi())
+        if problem:
+            logging.error(problem)
+            self._set_state("error", "Error", problem)
 
     # ── UI ──────────────────────────────────────────────────────────────
     def _build_ui(self):
@@ -459,9 +665,11 @@ class MainWindow(QWidget):
         card_layout.addSpacing(14)
         card_layout.addWidget(self.status_lbl)
 
-        # ── Subtitle ──
+        # ── Subtitle ── (wraps to two lines for error messages)
         self.sub_lbl = QLabel("Tap the button to connect")
         self.sub_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.sub_lbl.setWordWrap(True)
+        self.sub_lbl.setContentsMargins(18, 0, 18, 0)
         self.sub_lbl.setFont(QFont("Segoe UI", 10))
         self.sub_lbl.setStyleSheet(f"color: {C['muted']}; background: transparent;")
         card_layout.addSpacing(2)
@@ -491,6 +699,7 @@ class MainWindow(QWidget):
         self.mode_lbl = QLabel(MODE_TEXT)
         self.mode_lbl.setFont(QFont("Segoe UI", 9))
         self.mode_lbl.setStyleSheet(f"color: {C['muted']}; background: transparent;")
+        self.mode_lbl.setToolTip(f"goodbyedpi.exe {GDPI_ARGS}")
         pill_lay.addWidget(self.mode_lbl)
         pill_lay.addStretch()
 
@@ -520,9 +729,18 @@ class MainWindow(QWidget):
                 background-color: {C['surface']};
             }}
         """)
+        self._toggle_action = QAction("Connect", self)
+        self._toggle_action.triggered.connect(self._on_toggle)
+        menu.addAction(self._toggle_action)
+
         show_action = QAction("Show", self)
         show_action.triggered.connect(self._show_window)
         menu.addAction(show_action)
+
+        log_action = QAction("Open log", self)
+        log_action.triggered.connect(
+            lambda: QDesktopServices.openUrl(QUrl.fromLocalFile(LOG_PATH)))
+        menu.addAction(log_action)
 
         menu.addSeparator()
 
@@ -530,6 +748,7 @@ class MainWindow(QWidget):
         quit_action.triggered.connect(self._quit_app)
         menu.addAction(quit_action)
 
+        self._tray_menu = menu
         self.tray_icon.setContextMenu(menu)
         self.tray_icon.activated.connect(self._tray_activated)
         self.tray_icon.show()
@@ -543,23 +762,25 @@ class MainWindow(QWidget):
             pm.fill(Qt.GlobalColor.transparent)
         else:
             pm = base_pm.scaled(size, size, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
-            
+
         p = QPainter(pm)
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
-        
+
         if state == "on":
             colour = QColor(C["green"])
         elif state == "connecting":
             colour = QColor(C["accent"])
+        elif state == "error":
+            colour = QColor(C["red"])
         else:
             colour = QColor(C["dim"])
-            
+
         # Draw status indicator (small circle bottom right)
         p.setPen(QPen(QColor("#ffffff"), 2))
         p.setBrush(QBrush(colour))
         p.drawEllipse(44, 44, 16, 16)
         p.end()
-        
+
         self.tray_icon.setIcon(QIcon(pm))
 
     def _tray_activated(self, reason):
@@ -576,68 +797,105 @@ class MainWindow(QWidget):
         self.raise_()
         self.activateWindow()
 
+    # ── State / UI updates ──────────────────────────────────────────────
+    def _set_status(self, title, colour, sub):
+        self.status_lbl.setText(title)
+        self.status_lbl.setStyleSheet(f"color: {colour}; background: transparent;")
+        # Two lines fit under the button; the full text is in the tooltip/log.
+        # (1.75 × the line width leaves slack for where word-wrap breaks.)
+        line_width = self.width() - 36  # minus the label's side margins
+        short = self.sub_lbl.fontMetrics().elidedText(
+            sub, Qt.TextElideMode.ElideRight, int(line_width * 1.75))
+        self.sub_lbl.setText(short)
+        self.sub_lbl.setToolTip(sub if short != sub else "")
+        self.tray_icon.setToolTip(f"bb-DPI · {title}")
+
+    def _set_state(self, state, title="Failed", message=""):
+        self._state = state
+        if state == "connecting":
+            self.toggle.set_connecting()
+            self._set_status("Connecting…", C["accent"], "Starting GoodbyeDPI · tap to cancel")
+        elif state == "on":
+            self.toggle.set_on()
+            self._set_status("Connected", C["green"], "DPI bypass is active")
+            self._uptime_start = time.time()
+            self._uptime_timer.start()
+            self._update_uptime()
+        elif state == "error":
+            self.toggle.set_off()
+            self._set_status(title, C["red"], message)
+        else:
+            self.toggle.set_off()
+            self._set_status("Disconnected", C["dim"], "Tap the button to connect")
+
+        if state != "on":
+            self._uptime_timer.stop()
+            self.uptime_lbl.setText("")
+        # An empty uptime line still takes space; hide it to make room for
+        # two-line error messages. The layout doesn't grow a word-wrapped
+        # label by itself, so reserve the second line explicitly.
+        self.uptime_lbl.setVisible(state == "on")
+        two_lines = self.sub_lbl.fontMetrics().lineSpacing() * 2 + 2
+        self.sub_lbl.setMinimumHeight(two_lines if state == "error" else 0)
+        self._set_tray_icon(state)
+        self._toggle_action.setText("Disconnect" if state in ("connecting", "on") else "Connect")
+
+    def _show_error(self, title, message):
+        logging.error(f"{title}: {message}")
+        self._set_state("error", title, message)
+        if not self.isVisible():
+            self.tray_icon.showMessage(f"bb-DPI · {title}", message,
+                                       QSystemTrayIcon.MessageIcon.Warning, 8000)
+
     # ── Toggle logic ────────────────────────────────────────────────────
     def _on_toggle(self):
-        if self._is_running:
-            self._stop()
+        if self._state in ("connecting", "on"):
+            self._stop()   # also cancels a start that's still in progress
         else:
             self._start()
 
     def _start(self):
-        self.toggle.set_connecting()
-        self.status_lbl.setText("Connecting…")
-        self.status_lbl.setStyleSheet(f"color: {C['accent']}; background: transparent;")
-        self.sub_lbl.setText("Starting bb-DPI")
-        self._set_tray_icon("connecting")
+        if self._worker is not None:
+            # The previous goodbyedpi is still shutting down; never run two.
+            return
+        gdpi_dir, gdpi_path = find_gdpi()
+        problem = preflight(gdpi_dir, gdpi_path)
+        if problem:
+            self._show_error("Failed", problem)
+            return
 
-        self._worker = DPIWorker()
-        self._worker.started.connect(self._on_started)
-        self._worker.failed.connect(self._on_failed)
-        self._worker.finished_signal.connect(self._on_worker_done)
-        self._worker.start()
+        self._set_state("connecting")
+        worker = DPIWorker(gdpi_dir, gdpi_path, GDPI_ARGS, self._job, parent=self)
+        worker.connected.connect(self._on_connected)
+        worker.failed.connect(self._on_failed)
+        worker.finished.connect(self._on_worker_finished)
+        self._worker = worker
+        worker.start()
 
-    def _on_started(self):
-        self._is_running = True
-        self.toggle.set_on()
-        self.status_lbl.setText("Connected")
-        self.status_lbl.setStyleSheet(f"color: {C['green']}; background: transparent;")
-        self.sub_lbl.setText("DPI bypass is active")
-        self._set_tray_icon("on")
-        self._uptime_start = time.time()
-        self._uptime_timer.start()
+    def _on_connected(self):
+        if self._state == "connecting":
+            self._set_state("on")
 
-    def _on_failed(self, msg):
-        self.toggle.set_off()
-        self.status_lbl.setText("Failed")
-        self.status_lbl.setStyleSheet(f"color: {C['red']}; background: transparent;")
-        self.sub_lbl.setText(msg[:60])
-        self._set_tray_icon("off")
-        QTimer.singleShot(3000, self._reset_ui)
+    def _on_failed(self, title, message):
+        # Ignore late reports after the user already switched it off.
+        if self._state in ("connecting", "on"):
+            self._show_error(title, message)
 
-    def _on_worker_done(self):
-        if self._is_running:
-            self._is_running = False
-            self._reset_ui()
+    def _on_worker_finished(self):
+        worker, self._worker = self._worker, None
+        if worker is not None:
+            worker.deleteLater()
+        if self._state in ("connecting", "on"):
+            self._set_state("off")
 
     def _stop(self):
-        self.status_lbl.setText("Disconnecting…")
-        self.status_lbl.setStyleSheet(f"color: {C['accent']}; background: transparent;")
-        if self._worker:
-            self._worker.kill()
-        self._is_running = False
-        self._uptime_timer.stop()
-        self._reset_ui()
-
-    def _reset_ui(self):
-        self.toggle.set_off()
-        self.status_lbl.setText("Disconnected")
-        self.status_lbl.setStyleSheet(f"color: {C['dim']}; background: transparent;")
-        self.sub_lbl.setText("Tap the button to connect")
-        self.uptime_lbl.setText("")
-        self._set_tray_icon("off")
+        worker = self._worker
+        self._set_state("off")
+        if worker is not None and not worker.stop():
+            self._show_error("Error", "goodbyedpi.exe did not stop. End it in Task Manager.")
 
     def _update_uptime(self):
-        if not self._is_running:
+        if self._state != "on":
             return
         elapsed = int(time.time() - self._uptime_start)
         h, m, s = elapsed // 3600, (elapsed % 3600) // 60, elapsed % 60
@@ -661,9 +919,15 @@ class MainWindow(QWidget):
         ev.ignore()
         self.hide()
 
+    def shutdown(self):
+        """Stop goodbyedpi before bb-DPI exits (Quit, logoff, shutdown)."""
+        worker = self._worker
+        if worker is not None:
+            worker.stop()
+            worker.wait(3000)
+
     def _quit_app(self):
-        if self._worker:
-            self._worker.kill()
+        self.shutdown()
         self.tray_icon.hide()
         QApplication.quit()
 
@@ -672,6 +936,13 @@ class MainWindow(QWidget):
 #  Entry point
 # ═══════════════════════════════════════════════════════════════════════════════
 def main():
+    # goodbyedpi needs admin rights to load its driver. The built .exe asks for
+    # them through its manifest; this covers running `python app.py`.
+    if IS_WINDOWS and not is_admin() and "--elevated" not in sys.argv:
+        if relaunch_as_admin():
+            return
+        logging.warning("Not running as Administrator (UAC prompt declined or failed).")
+
     # Fix High DPI scaling artifacts (like 1px gaps) on Windows 11
     QApplication.setHighDpiScaleFactorRoundingPolicy(Qt.HighDpiScaleFactorRoundingPolicy.PassThrough)
     app = QApplication(sys.argv)
@@ -679,9 +950,20 @@ def main():
 
     app.setFont(QFont("Segoe UI", 10))
 
+    # Only one bb-DPI at a time; a second copy would start a second goodbyedpi.
+    lock = QLockFile(os.path.join(tempfile.gettempdir(), "bb-DPI.lock"))
+    lock.setStaleLockTime(0)
+    if not lock.tryLock(100):
+        QMessageBox.information(None, "bb-DPI",
+                                "bb-DPI is already running. Look for its icon in the system tray.")
+        return
+
     win = MainWindow()
+    app.aboutToQuit.connect(win.shutdown)
     win._show_window()
-    sys.exit(app.exec())
+    code = app.exec()
+    lock.unlock()
+    sys.exit(code)
 
 if __name__ == "__main__":
     main()
